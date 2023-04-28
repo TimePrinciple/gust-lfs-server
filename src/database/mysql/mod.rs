@@ -1,6 +1,7 @@
 pub mod meta_storage;
 
-use std::{env, time::Duration};
+use std::env;
+use std::time::Duration;
 
 use sea_orm::{ConnectOptions, Database};
 use tracing::log;
@@ -8,8 +9,7 @@ use tracing::log;
 use self::meta_storage::MysqlStorage;
 
 pub async fn init() -> MysqlStorage {
-    let db_url = "mysql://root:heruoqing@localhost:3333/test";
-    // let db_url = env::var("DATABASE_URL").expect("DATABASE_URL is not set in .env file");
+    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL is not set in .env file");
     let mut opt = ConnectOptions::new(db_url.to_owned());
     // max_connections is properly for double size of the cpu core
     opt.max_connections(32)

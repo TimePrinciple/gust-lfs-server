@@ -7,6 +7,7 @@ use anyhow::Result;
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     server::lfs_server().await.unwrap();
 
     Ok(())

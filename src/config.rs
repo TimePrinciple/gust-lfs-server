@@ -97,8 +97,7 @@ impl Configuration {
                 if env == "" {
                     env = "lfs-content".to_string();
                 }
-                // env
-                "content-store".to_owned()
+                env.to_owned()
             },
             admin_user: {
                 let env_var = format!("{}_{}", KEY_PREFIX, "");
@@ -178,6 +177,8 @@ impl Configuration {
             },
         };
         let env = format!("{}://{}", config.scheme, config.host);
+
+        config.ext_origin = env;
 
         config
     }

@@ -2,28 +2,26 @@ use crate::config::Configuration;
 use crate::content_store::ContentStore;
 use crate::database::mysql;
 use anyhow::Result;
-use axum::handler::Handler;
 use axum::http::header::{ACCEPT, AUTHORIZATION};
 use bytes::{BufMut, BytesMut};
 use futures_util::StreamExt;
+use rand::prelude::*;
 use std::collections::HashMap;
 use std::env;
-use std::fs;
 use std::io::prelude::*;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use axum::body::Body;
-use axum::extract::{BodyStream, Path, Query, State};
-use axum::http::{header::HeaderMap, Request, Response, StatusCode};
+use axum::extract::{BodyStream, Path, State};
+use axum::http::{header::HeaderMap, Response, StatusCode};
 use axum::routing::{get, post};
 use axum::{Router, Server};
 use serde::{Deserialize, Serialize};
-use tower_http::validate_request::ValidateRequestHeaderLayer;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RequestVars {
@@ -40,7 +38,7 @@ impl RequestVars {
         self.internal_link("objects".to_string(), config).await
     }
 
-    async fn upload_link(&self, config: Arc<Mutex<Configuration>>, use_tus: bool) -> String {
+    async fn upload_link(&self, config: Arc<Mutex<Configuration>>) -> String {
         self.internal_link("objects".to_string(), config).await
     }
 
@@ -114,12 +112,12 @@ pub struct Representation {
     pub error: ObjectError,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
     pub name: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Lock {
     pub id: String,
     pub path: String,
@@ -132,31 +130,37 @@ pub struct LockRequest {
     pub path: String,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct LockResponse {
     pub lock: Lock,
     pub message: String,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct UnlockRequest {
     pub force: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct UnlockResponse {
     pub lock: Lock,
     pub message: String,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct LockList {
     pub locks: Vec<Lock>,
     pub next_cursor: String,
     pub message: String,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct VerifiableLockRequest {
     pub cursor: String,
     pub limit: i64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct VerifiableLockList {
     pub ours: Vec<Lock>,
     pub theirs: Vec<Lock>,
@@ -172,9 +176,9 @@ struct AppState {
 
 pub async fn lfs_server() -> Result<(), Box<dyn std::error::Error>> {
     // load env variables
-    // let host = env::var("HOST").expect("HOST is not set in .env file");
-    // let port = env::var("PORT").expect("PORT is not set in .env file");
-    let server_url = format!("{}:{}", "127.0.0.1", "9999");
+    let host = env::var("HOST").expect("HOST is not set in .env file");
+    let port = env::var("PORT").expect("PORT is not set in .env file");
+    let server_url = format!("{}:{}", host, port);
 
     let state = AppState {
         config: Arc::new(Mutex::new(Configuration::init())),
@@ -194,12 +198,6 @@ pub async fn lfs_server() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/:user/:repo/locks/verify", post(locks_verify_handler))
         .route("/:user/:repo/locks/:id/unlock", post(delete_lock_handler))
-        .route("/objects/batch", post(batch_handler))
-        .route("/objects/:oid", get(method_router).put(put_handler))
-        .route("/objects", post(post_handler))
-        .route("/verify/:oid", post(verify_handler))
-        // .route("/:user/:repo/objects/:oid", get(get_meta_handler)
-        //     .route_layer(ValidateRequestHeaderLayer::accept("application/vnd.git-lfs+json")))
         .with_state(state);
 
     let addr = SocketAddr::from_str(&server_url).unwrap();
@@ -340,18 +338,6 @@ async fn logged_method_router(
     }
 }
 
-async fn method_router(headers: HeaderMap, Path(oid): Path<String>) {
-    // let h = headers[ACCEPT].to_str().unwrap();
-
-    // if h == "application/vnd.git-lfs" {
-    //     get_content_handler().await
-    // } else if h == "application/vnd.git-lfs+json" {
-    //     get_meta_handler().await
-    // } else {
-    //     "Error".to_owned()
-    // }
-}
-
 async fn get_content_handler(
     request_vars: RequestVars,
     db: Arc<Mutex<mysql::meta_storage::MysqlStorage>>,
@@ -482,24 +468,46 @@ async fn post_handler(
     Ok(resp)
 }
 
-async fn locks_handler() {}
-
-async fn locks_verify_handler() {}
-
-async fn create_lock_handler(
+async fn locks_handler(
     state: State<AppState>,
-    headers: HeaderMap,
+    Path((_, repo)): Path<(String, String)>,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let mut resp = Response::builder();
+    resp = resp.header("Content-Type", "application/vnd.git-lfs+json");
+
+    let db = Arc::clone(&state.db_storage);
+    let db = db.lock().await;
+    let (locks, next_cursor, ok) = db
+        .filterd_locks(&repo, &"".to_string(), &"".to_string(), &"".to_string())
+        .await;
+
+    let mut lock_list = LockList {
+        locks: vec![],
+        next_cursor: "".to_string(),
+        message: "".to_string(),
+    };
+
+    if !ok {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Lookup operation failed!".to_string(),
+        ));
+    } else {
+        lock_list.locks = locks.clone();
+        lock_list.next_cursor = next_cursor;
+    }
+
+    let locks_response = serde_json::to_string(&lock_list).unwrap();
+    let body = Body::from(locks_response);
+
+    Ok(resp.body(body).unwrap())
+}
+
+async fn locks_verify_handler(
+    state: State<AppState>,
     Path((user, repo)): Path<(String, String)>,
     mut stream: BodyStream,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-   	// vars := mux.Vars(r)
-	// repo := vars["repo"]
-	// user := context.Get(r, "USER").(string)
-
-	// dec := json.NewDecoder(r.Body)
-	// enc := json.NewEncoder(w)
-
-	// w.Header().Set("Content-Type", metaMediaType)
     let mut resp = Response::builder();
     resp = resp.header("Content-Type", "application/vnd.git-lfs+json");
 
@@ -508,52 +516,186 @@ async fn create_lock_handler(
         buffer.put(chunk.unwrap());
     }
 
-    let mut lock_request: LockRequest = serde_json::from_slice(buffer.freeze().as_ref()).unwrap();
-	// var lockRequest LockRequest
-	// if err := dec.Decode(&lockRequest); err != nil {
-	// 	w.WriteHeader(http.StatusBadRequest)
-	// 	enc.Encode(&LockResponse{Message: err.Error()})
-	// 	return
-	// }
+    let verifiable_lock_request: VerifiableLockRequest =
+        serde_json::from_slice(buffer.freeze().as_ref()).unwrap();
+    let mut limit = verifiable_lock_request.limit;
+    if limit == 0 {
+        limit = 100;
+    }
 
+    let db = Arc::clone(&state.db_storage);
+    let db = db.lock().await;
+    let (locks, next_cursor, ok) = db
+        .filterd_locks(
+            &repo,
+            &"".to_string(),
+            &verifiable_lock_request.cursor,
+            &limit.to_string(),
+        )
+        .await;
 
-	// locks, _, err := a.metaStore.FilteredLocks(repo, lockRequest.Path, "", "1")
-	// if err != nil {
-	// 	w.WriteHeader(http.StatusInternalServerError)
-	// 	enc.Encode(&LockResponse{Message: err.Error()})
-	// 	return
-	// }
-	// if len(locks) > 0 {
-	// 	w.WriteHeader(http.StatusConflict)
-	// 	enc.Encode(&LockResponse{Message: "lock already created"})
-	// 	return
-	// }
+    let mut lock_list = VerifiableLockList {
+        ours: vec![],
+        theirs: vec![],
+        next_cursor: "".to_string(),
+        message: "".to_string(),
+    };
 
-	// lock := &Lock{
-	// 	Id:       randomLockId(),
-	// 	Path:     lockRequest.Path,
-	// 	Owner:    User{Name: user},
-	// 	LockedAt: time.Now(),
-	// }
+    if !ok {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Lookup operation failed!".to_string(),
+        ));
+    } else {
+        lock_list.next_cursor = next_cursor;
 
-	// if err := a.metaStore.AddLocks(repo, *lock); err != nil {
-	// 	w.WriteHeader(http.StatusInternalServerError)
-	// 	enc.Encode(&LockResponse{Message: err.Error()})
-	// 	return
-	// }
+        for lock in locks.iter() {
+            if lock.owner.name == user {
+                lock_list.ours.push(lock.clone());
+            } else {
+                lock_list.theirs.push(lock.clone());
+            }
+        }
+    }
 
-	// w.WriteHeader(http.StatusCreated)
-	// enc.Encode(&LockResponse{
-	// 	Lock: lock,
-	// })
+    let locks_response = serde_json::to_string(&lock_list).unwrap();
+    let body = Body::from(locks_response);
 
-	// logRequest(r, 200)
-    Ok(Response::new(Body::empty()))
+    Ok(resp.body(body).unwrap())
 }
 
-async fn delete_lock_handler() {}
+async fn create_lock_handler(
+    state: State<AppState>,
+    Path((user, repo)): Path<(String, String)>,
+    mut stream: BodyStream,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let mut resp = Response::builder();
+    resp = resp.header("Content-Type", "application/vnd.git-lfs+json");
 
-async fn verify_handler() {}
+    let mut buffer = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        buffer.put(chunk.unwrap());
+    }
+
+    let lock_request: LockRequest = serde_json::from_slice(buffer.freeze().as_ref()).unwrap();
+
+    let db = Arc::clone(&state.db_storage);
+    let db = db.lock().await;
+
+    let (locks, _, ok) = db
+        .filterd_locks(
+            &repo,
+            &lock_request.path.to_string(),
+            &"".to_string(),
+            &"1".to_string(),
+        )
+        .await;
+    if !ok {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed when filtering locks!".to_string(),
+        ));
+    }
+
+    if locks.len() > 0 {
+        return Err((StatusCode::CONFLICT, "Lock already exist".to_string()));
+    }
+
+    let lock = Lock {
+        id: {
+            let mut random_num = String::new();
+            let mut rng = rand::thread_rng();
+            for _ in 0..8 {
+                random_num += &(rng.gen_range(0..9)).to_string();
+            }
+            random_num
+        },
+        path: lock_request.path.to_owned(),
+        owner: User {
+            name: user.to_owned(),
+        },
+        locked_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64(),
+    };
+
+    let ok = db.add_locks(&repo, vec![lock.clone()]).await;
+    if !ok {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed when adding locks!".to_string(),
+        ));
+    }
+
+    resp = resp.status(StatusCode::CREATED);
+
+    let lock_response = LockResponse {
+        lock,
+        message: "".to_string(),
+    };
+    let lock_response = serde_json::to_string(&lock_response).unwrap();
+
+    let body = Body::from(lock_response);
+    Ok(resp.body(body).unwrap())
+}
+
+async fn delete_lock_handler(
+    state: State<AppState>,
+    Path((user, repo, id)): Path<(String, String, String)>,
+    mut stream: BodyStream,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    // Retrieve information from request body.
+    let mut resp = Response::builder();
+    resp = resp.header("Content-Type", "application/vnd.git-lfs+json");
+
+    let mut buffer = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        buffer.put(chunk.unwrap());
+    }
+
+    if id.len() == 0 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid lock id!".to_string()));
+    }
+
+    if buffer.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Deserialize operation failed!".to_string(),
+        ));
+    }
+    let unlock_request: UnlockRequest = serde_json::from_slice(buffer.freeze().as_ref()).unwrap();
+
+    let db = Arc::clone(&state.db_storage);
+    let db = db.lock().await;
+
+    let (deleted_lock, ok) = db
+        .delete_lock(&repo, &user, &id, unlock_request.force)
+        .await;
+    if !ok {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Delete operation failed!".to_string(),
+        ));
+    }
+
+    if deleted_lock.id == ""
+        && deleted_lock.path == ""
+        && deleted_lock.owner.name == ""
+        && deleted_lock.locked_at as i64 == 0
+    {
+        return Err((StatusCode::NOT_FOUND, "Unable to find lock!".to_string()));
+    }
+
+    let unlock_response = UnlockResponse {
+        lock: deleted_lock,
+        message: "".to_string(),
+    };
+    let unlock_response = serde_json::to_string(&unlock_response).unwrap();
+
+    let body = Body::from(unlock_response);
+    Ok(resp.body(body).unwrap())
+}
 
 async fn represent(
     rv: &RequestVars,
@@ -603,7 +745,7 @@ async fn represent(
             Link {
                 href: {
                     let config = Arc::clone(&config);
-                    rv.upload_link(config, use_tus).await
+                    rv.upload_link(config).await
                 },
                 header: header.clone(),
                 expires_at: 0 as f64,
@@ -666,7 +808,7 @@ mod tests {
             .await;
         println!("{:?}", res);
 
-        let res = request_var.upload_link(Arc::clone(&config), false).await;
+        let res = request_var.upload_link(Arc::clone(&config)).await;
         println!("{:?}", res);
 
         let res = request_var.verify_link(Arc::clone(&config)).await;

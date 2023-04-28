@@ -1,15 +1,8 @@
-use crate::database::entity::meta::{self};
 use crate::database::entity::locks::{self};
+use crate::database::entity::meta::{self};
 use crate::server::{Lock, MetaObject, RequestVars, User};
-use sea_orm::ActiveValue::NotSet;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait,
-    InsertResult, QueryFilter, Set, Statement,
-};
-use std::path;
-use serde::{Deserialize, Serialize};
-use std::time::{UNIX_EPOCH, SystemTime};
-
+use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
+use std::cmp::min;
 
 #[derive(Debug, Default, Clone)]
 pub struct MysqlStorage {
@@ -88,14 +81,16 @@ impl MysqlStorage {
             .await
             .unwrap();
 
-        let data = match result {
-            Some(val) => val.data.to_owned(),
-            None => "".to_string(),
-        };
-        
-        let locks: Vec<Lock> = serde_json::from_str(&data).unwrap();
-
-        locks
+        match result {
+            Some(val) => {
+                let data = val.data.to_owned();
+                let locks: Vec<Lock> = serde_json::from_str(&data).unwrap();
+                locks
+            }
+            None => {
+                vec![]
+            }
+        }
     }
 
     pub async fn add_locks(&self, repo: &String, locks: Vec<Lock>) -> bool {
@@ -116,15 +111,27 @@ impl MysqlStorage {
                 };
                 let mut locks = locks;
                 locks_from_data.append(&mut locks);
+
+                locks_from_data.sort_by(|a, b| {
+                    a.locked_at
+                        .partial_cmp(&b.locked_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let d = serde_json::to_string(&locks_from_data).unwrap();
 
                 let mut lock_to: locks::ActiveModel = val.into();
                 lock_to.data = Set(d.to_owned());
                 let res = lock_to.update(&self.connection).await;
                 res.is_ok()
-            },
+            }
             // Insert
             None => {
+                let mut locks = locks;
+                locks.sort_by(|a, b| {
+                    a.locked_at
+                        .partial_cmp(&b.locked_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let data = serde_json::to_string(&locks).unwrap();
                 let lock_to = locks::ActiveModel {
                     id: Set(repo.to_owned()),
@@ -132,15 +139,162 @@ impl MysqlStorage {
                 };
                 let res = locks::Entity::insert(lock_to).exec(&self.connection).await;
                 res.is_ok()
+            }
+        }
+    }
+
+    pub async fn filterd_locks(
+        &self,
+        repo: &String,
+        path: &String,
+        cursor: &String,
+        limit: &String,
+    ) -> (Vec<Lock>, String, bool) {
+        let mut locks = self.locks(&repo.to_owned()).await;
+
+        if cursor != "" {
+            let mut last_seen = -1;
+            for (i, v) in locks.iter().enumerate() {
+                if v.id == *cursor {
+                    last_seen = i as i32;
+                    break;
+                }
+            }
+
+            if last_seen > -1 {
+                locks = locks.split_off(last_seen as usize);
+            } else {
+                // Cursor not found.
+                return (vec![], "".to_string(), false);
+            }
+        }
+
+        if path != "" {
+            let mut filterd = Vec::<Lock>::new();
+            for lock in locks.iter() {
+                if lock.path == *path {
+                    filterd.push(Lock {
+                        id: lock.id.to_owned(),
+                        path: lock.path.to_owned(),
+                        owner: User {
+                            name: lock.owner.name.to_owned(),
+                        },
+                        locked_at: lock.locked_at,
+                    });
+                }
+            }
+            locks = filterd;
+        }
+
+        let mut next = "".to_string();
+        if limit != "" {
+            let mut size = limit.parse::<i64>().unwrap();
+            size = min(size, locks.len() as i64);
+
+            if size + 1 < locks.len() as i64 {
+                next = locks[size as usize].id.to_owned();
+            }
+            let _ = locks.split_off(size as usize);
+        }
+
+        (locks, next, true)
+    }
+
+    pub async fn delete_lock(
+        &self,
+        repo: &String,
+        user: &String,
+        id: &String,
+        force: bool,
+    ) -> (Lock, bool) {
+        let empty_lock = Lock {
+            id: "".to_owned(),
+            path: "".to_owned(),
+            owner: User {
+                name: "".to_owned(),
             },
+            locked_at: 0 as f64,
+        };
+        let result = locks::Entity::find_by_id(repo.to_owned())
+            .one(&self.connection)
+            .await
+            .unwrap();
+
+        match result {
+            // Exist, then delete.
+            Some(val) => {
+                let d = val.data.to_owned();
+                let locks_from_data = if d != "" {
+                    let locks_from_data: Vec<Lock> = serde_json::from_str(&d).unwrap();
+                    locks_from_data
+                } else {
+                    vec![]
+                };
+
+                let mut new_locks = Vec::<Lock>::new();
+                let mut lock_to_delete = Lock {
+                    id: "".to_owned(),
+                    path: "".to_owned(),
+                    owner: User {
+                        name: "".to_owned(),
+                    },
+                    locked_at: 0 as f64,
+                };
+
+                for lock in locks_from_data.iter() {
+                    if lock.id == *id {
+                        if lock.owner.name != *user && !force {
+                            return (empty_lock, false);
+                        }
+                        lock_to_delete.id = lock.id.to_owned();
+                        lock_to_delete.path = lock.path.to_owned();
+                        lock_to_delete.owner = User {
+                            name: lock.owner.name.to_owned(),
+                        };
+                        lock_to_delete.locked_at = lock.locked_at;
+                    } else if lock.id.len() > 0 {
+                        new_locks.push(Lock {
+                            id: lock.id.to_owned(),
+                            path: lock.path.to_owned(),
+                            owner: User {
+                                name: lock.owner.name.to_owned(),
+                            },
+                            locked_at: lock.locked_at,
+                        });
+                    }
+                }
+                if lock_to_delete.id == "" {
+                    return (empty_lock, false);
+                }
+
+                // No locks remains, delete the repo from database.
+                if new_locks.len() == 0 {
+                    locks::Entity::delete_by_id(repo.to_owned())
+                        .exec(&self.connection)
+                        .await
+                        .unwrap();
+
+                    return (lock_to_delete, true);
+                }
+
+                // Update remaining locks.
+                let data = serde_json::to_string(&new_locks).unwrap();
+
+                let mut lock_to: locks::ActiveModel = val.into();
+                lock_to.data = Set(data.to_owned());
+                let res = lock_to.update(&self.connection).await;
+                (lock_to_delete, res.is_ok())
+            }
+            // Not exist, error.
+            None => (empty_lock, false),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::database::mysql;
+    // use super::*;
+    // use crate::database::mysql;
 
     // #[tokio::test]
     // async fn test_get() {
@@ -190,20 +344,20 @@ mod tests {
     //     println!("{:?}", delete_res);
     // }
 
-    fn new_test_lock(repo: String, path: String, user: String) -> Lock {
-        Lock {
-            id: repo.to_owned(),
-            path: path.to_owned(),
-            owner: User {
-                name: user.to_owned(),
-            },
-            locked_at: {
-                let now = SystemTime::now();
-                let res = now.duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-                res
-            },
-        }
-    }
+    // fn new_test_lock(repo: String, path: String, user: String) -> Lock {
+    //     Lock {
+    //         id: repo.to_owned(),
+    //         path: path.to_owned(),
+    //         owner: User {
+    //             name: user.to_owned(),
+    //         },
+    //         locked_at: {
+    //             let now = std::time::SystemTime::now();
+    //             let res = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    //             res
+    //         },
+    //     }
+    // }
 
     // #[tokio::test]
     // async fn test_locks() {
@@ -218,11 +372,18 @@ mod tests {
     //     db.add_locks(&"test_repo".to_string(), test_locks).await;
     // }
 
-    #[tokio::test]
-    async fn test_get_locks() {
-        let db = mysql::init().await;
-        let locks = db.locks(&"test_repo".to_string()).await;
+    // #[tokio::test]
+    // async fn test_get_locks() {
+    //     let db = mysql::init().await;
+    //     let locks = db.locks(&"test_repo".to_string()).await;
 
-        println!("{:?}", locks);
-    }
+    //     println!("{:?}", locks);
+    // }
+
+    // #[tokio::test]
+    // async fn test_delete_locks() {
+    //     let db = mysql::init().await;
+    //     let deleted = db.delete_lock(&"test_repo".to_string(), &"test1_user".to_string(), &"test1".to_string(), false).await;
+    //     println!("{:?}", deleted);
+    // }
 }

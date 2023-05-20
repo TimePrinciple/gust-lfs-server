@@ -1,6 +1,7 @@
 use crate::database::entity::locks::{self};
 use crate::database::entity::meta::{self};
-use crate::server::{Lock, MetaObject, RequestVars, User};
+use crate::server::{Lock, MetaObject, RequestVars};
+use chrono::prelude::*;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
 use std::cmp::min;
 
@@ -49,13 +50,13 @@ impl MysqlStorage {
         let meta = MetaObject {
             oid: v.oid.to_string(),
             size: v.size,
-            exist: false,
+            exist: true,
         };
 
         let meta_to = meta::ActiveModel {
             oid: Set(meta.oid.to_owned()),
             size: Set(meta.size.to_owned()),
-            exist: Set(false),
+            exist: Set(true),
         };
 
         let res = meta::Entity::insert(meta_to).exec(&self.connection).await;
@@ -151,6 +152,7 @@ impl MysqlStorage {
         limit: &String,
     ) -> (Vec<Lock>, String, bool) {
         let mut locks = self.locks(&repo.to_owned()).await;
+        println!("Locks retrieved: {:?}", locks);
 
         if cursor != "" {
             let mut last_seen = -1;
@@ -176,10 +178,8 @@ impl MysqlStorage {
                     filterd.push(Lock {
                         id: lock.id.to_owned(),
                         path: lock.path.to_owned(),
-                        owner: User {
-                            name: lock.owner.name.to_owned(),
-                        },
-                        locked_at: lock.locked_at,
+                        owner: lock.owner.clone(),
+                        locked_at: lock.locked_at.to_owned(),
                     });
                 }
             }
@@ -203,17 +203,18 @@ impl MysqlStorage {
     pub async fn delete_lock(
         &self,
         repo: &String,
-        user: &String,
+        _user: Option<String>,
         id: &String,
         force: bool,
     ) -> (Lock, bool) {
         let empty_lock = Lock {
             id: "".to_owned(),
             path: "".to_owned(),
-            owner: User {
-                name: "".to_owned(),
+            owner: None,
+            locked_at: {
+                let locked_at: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
+                locked_at.to_rfc3339().to_string()
             },
-            locked_at: 0 as f64,
         };
         let result = locks::Entity::find_by_id(repo.to_owned())
             .one(&self.connection)
@@ -235,31 +236,28 @@ impl MysqlStorage {
                 let mut lock_to_delete = Lock {
                     id: "".to_owned(),
                     path: "".to_owned(),
-                    owner: User {
-                        name: "".to_owned(),
+                    owner: None,
+                    locked_at: {
+                        let locked_at: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
+                        locked_at.to_rfc3339().to_string()
                     },
-                    locked_at: 0 as f64,
                 };
 
                 for lock in locks_from_data.iter() {
                     if lock.id == *id {
-                        if lock.owner.name != *user && !force {
+                        if lock.owner != None && !force {
                             return (empty_lock, false);
                         }
                         lock_to_delete.id = lock.id.to_owned();
                         lock_to_delete.path = lock.path.to_owned();
-                        lock_to_delete.owner = User {
-                            name: lock.owner.name.to_owned(),
-                        };
-                        lock_to_delete.locked_at = lock.locked_at;
+                        lock_to_delete.owner = lock.owner.clone();
+                        lock_to_delete.locked_at = lock.locked_at.to_owned();
                     } else if lock.id.len() > 0 {
                         new_locks.push(Lock {
                             id: lock.id.to_owned(),
                             path: lock.path.to_owned(),
-                            owner: User {
-                                name: lock.owner.name.to_owned(),
-                            },
-                            locked_at: lock.locked_at,
+                            owner: lock.owner.clone(),
+                            locked_at: lock.locked_at.to_owned(),
                         });
                     }
                 }

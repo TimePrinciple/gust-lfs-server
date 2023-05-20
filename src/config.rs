@@ -2,7 +2,7 @@ use std::env;
 
 const KEY_PREFIX: &str = "LFS";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Configuration {
     pub listen: String,
     pub host: String,
@@ -41,7 +41,7 @@ impl Configuration {
     pub fn init() -> Configuration {
         let mut config = Configuration {
             listen: {
-                let env_var = format!("{}_{}", KEY_PREFIX, "");
+                let env_var = format!("{}_{}", KEY_PREFIX, "LISTEN");
                 let mut env = match env::var(env_var) {
                     Ok(val) => val,
                     Err(_) => "".to_string(),
@@ -59,7 +59,7 @@ impl Configuration {
                 env
             },
             host: {
-                let env_var = format!("{}_{}", KEY_PREFIX, "");
+                let env_var = format!("{}_{}", KEY_PREFIX, "HOST");
                 let mut env = match env::var(env_var) {
                     Ok(val) => val,
                     Err(_) => "".to_string(),
